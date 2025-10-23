@@ -1,61 +1,63 @@
--- ============================================================================
--- PROJECT: INTELLIGENT STOCK ALLOCATION SYSTEM
--- ============================================================================
--- Author: Aine Gradisher
--- GitHub: https://github.com/ainegradisher/sql-query-portfolio
--- Created: October 2025
--- 
--- ============================================================================
--- SCHEMA DISCLAIMER:
--- ============================================================================
--- The database schema shown (table names, columns, relationships) is a 
--- GENERIC, ANONYMIZED representation created for portfolio demonstration.
--- 
--- This structure:
--- • Does NOT represent any specific company's actual database
--- • Uses common naming conventions similar to standard ERP systems
--- • Is designed to demonstrate SQL techniques, not reproduce proprietary schemas
--- • Has been modified from original work to remove all identifying information
--- 
--- The VALUE of this portfolio piece is the PROBLEM-SOLVING APPROACH and
--- TECHNICAL IMPLEMENTATION, not the specific schema design.
--- ============================================================================
--- ============================================================================
--- PURPOSE: Automated stock distribution across customer orders using priority 
---          ranking based on promised delivery dates and real-time stock levels
--- 
--- BUSINESS PROBLEM SOLVED:
---   - Manual stock allocation took 3-4 hours daily
---   - Inconsistent decisions across different planners
---   - Urgent deadlines sometimes missed due to manual errors
---   - Gave planners ability to prioritise stock easily and quickly
---
--- TECHNICAL APPROACH:
---   - Uses Common Table Expressions (CTEs) for modular, readable logic
---   - Window functions for running totals and priority ranking
---   - Multi-currency handling with exchange rate conversions
---   - Waterfall allocation algorithm (highest priority gets stock first)
---
--- BUSINESS IMPACT:
---   - Reduced reporting time from 3-4 hours to <5 minutes daily
---   - £17,000 in admin tasks saved
---   - 100% consistent allocation logic
---   - Zero data errors and missed deadlines
---
--- TECHNICAL REQUIREMENTS:
---   - SQL Server 2016+ (or any RDBMS supporting window functions)
---   - No external dependencies
---   - Typical execution time: 2-3 seconds for 10,000 order lines
---
--- KEY SQL TECHNIQUES DEMONSTRATED:
---   ✓ Common Table Expressions (CTEs)
---   ✓ Window Functions (ROW_NUMBER, SUM OVER)
---   ✓ Complex Multi-Table Joins
---   ✓ Running Totals with Custom Frame Clauses
---   ✓ Advanced CASE Logic
---   ✓ Currency Conversion Handling
---   ✓ NULL Safety (ISNULL, NULLIF)
--- ============================================================================
+/*
+ ============================================================================
+ PROJECT: INTELLIGENT STOCK ALLOCATION SYSTEM
+ ============================================================================
+ Author: Aine Gradisher
+ GitHub: https://github.com/ainegradisher/sql-query-portfolio
+ Created: October 2025
+ 
+ ============================================================================
+ SCHEMA DISCLAIMER:
+ ============================================================================
+ The database schema shown (table names, columns, relationships) is a 
+ GENERIC, ANONYMIZED representation created for portfolio demonstration.
+ 
+ This structure:
+ - Does NOT represent any specific company's actual database
+ - Uses common naming conventions similar to standard ERP systems
+ - Is designed to demonstrate SQL techniques, not reproduce proprietary schemas
+ - Has been modified from original work to remove all identifying information
+ 
+ The VALUE of this portfolio piece is the PROBLEM-SOLVING APPROACH and
+ TECHNICAL IMPLEMENTATION, not the specific schema design.
+ ============================================================================
+ ============================================================================
+ PURPOSE: Automated stock distribution across customer orders using priority 
+          ranking based on promised delivery dates and real-time stock levels
+ 
+ BUSINESS PROBLEM SOLVED:
+   - Manual stock allocation took 3-4 hours daily
+   - Inconsistent decisions across different planners
+   - Urgent deadlines sometimes missed due to manual errors
+   - Gave planners ability to prioritise stock easily and quickly
+
+ TECHNICAL APPROACH:
+   - Uses Common Table Expressions (CTEs) for modular, readable logic
+   - Window functions for running totals and priority ranking
+   - Multi-currency handling with exchange rate conversions
+   - Waterfall allocation algorithm (highest priority gets stock first)
+
+ BUSINESS IMPACT:
+   - Reduced reporting time from 3-4 hours to <5 minutes daily
+   - £17,000 in admin tasks saved
+   - 100% consistent allocation logic
+   - Zero data errors and missed deadlines
+
+ TECHNICAL REQUIREMENTS:
+   - SQL Server 2016+ (or any RDBMS supporting window functions)
+   - No external dependencies
+   - Typical execution time: 2-3 seconds for 10,000 order lines
+
+ KEY SQL TECHNIQUES DEMONSTRATED:
+   ✓ Common Table Expressions (CTEs)
+   ✓ Window Functions (ROW_NUMBER, SUM OVER)
+   ✓ Complex Multi-Table Joins
+   ✓ Running Totals with Custom Frame Clauses
+   ✓ Advanced CASE Logic
+   ✓ Currency Conversion Handling
+   ✓ NULL Safety (ISNULL, NULLIF)
+ ============================================================================
+*/
 
 -- ============================================================================
 -- CTE 1: NOMINAL ACCOUNT DEDUPLICATION
@@ -156,258 +158,204 @@ OrderLinesWithPriority AS (
         -- =====================================================================
         -- DATE TRACKING
         -- =====================================================================
-        OrderHeader.DocumentDate,                              -- When order was placed
-        OrderLine.RequestedDeliveryDate,                       -- When customer asked for
-        OrderLine.PromisedDeliveryDate,                        -- When we promised to deliver
+        OrderHeader.DocumentDate,                              -- Order creation date
+        OrderHeader.RequestedDeliveryDate,                     -- What customer asked for
+        OrderHeader.PromisedDeliveryDate,                      -- What we committed to
+        OrderHeader.SourceDocumentNo,                          -- Original quote/reference
         
         -- =====================================================================
-        -- REFERENCE FIELDS
+        -- METADATA & STATUS
         -- =====================================================================
-        OrderHeader.SourceDocumentNo,                          -- Original quote/invoice ref
-        OrderLine.NominalAccountRef,                           -- Financial account code
-        OrderLine.LineTypeID,                                  -- 0=Stock, 1=Text, 2=Charge, 3=Comment
-        OrderHeader.DocumentStatusId,                          -- 0=Live, 1=Hold, 2=Complete, etc.
-        OrderHeader.DocumentTypeID,                            -- 0=Sales Order, 1=Return
-        NL.AccountName AS NominalAccountName,                  -- Readable account name
+        OrderLine.LineTypeID,                                  -- Stock/Service/Comment
+        OrderHeader.DocumentTypeID,                            -- Order/Return
+        OrderHeader.DocumentStatusId,                          -- Live/Hold/Complete
         
         -- =====================================================================
-        -- STOCK ALLOCATION LOGIC
+        -- ACCOUNTING LINKAGE
         -- =====================================================================
-        -- Calculate how much of this line should participate in stock distribution
-        CASE 
-            WHEN OrderLine.AllocatedQuantity > 0 THEN 0        
-            -- Already allocated = don't include in new distribution
-            ELSE OrderLine.LineQuantity - OrderLine.DespatchReceiptQuantity
-            -- Not yet allocated = full outstanding quantity is eligible
-        END AS EligibleQuantityDue,
+        UNA.AccountNumber AS NominalAccountRef,                -- GL account code
+        UNA.AccountName AS NominalAccountName,                 -- GL account description
         
         -- =====================================================================
-        -- PRIORITY RANKING ALGORITHM
+        -- PRIORITY CALCULATION (THE CORE LOGIC)
         -- =====================================================================
-        -- ROW_NUMBER creates a unique sequential number within each item
         ROW_NUMBER() OVER (
-            PARTITION BY OrderLineView.ItemCode                
-            -- Separate priority queue for each product
-            -- (stock of item A doesn't affect item B)
+            PARTITION BY OrderLineView.ItemCode               -- Separate ranking per SKU
             ORDER BY 
-                CASE WHEN OrderLine.AllocatedQuantity > 0 THEN 1 ELSE 0 END,
-                -- Push already-allocated orders to bottom of priority list
-                OrderLine.PromisedDeliveryDate ASC,            
-                -- Earliest promised delivery date gets highest priority
-                OrderHeader.DocumentDate ASC                   
-                -- If promised dates are equal, older order wins
+                -- Priority 1: Deprioritize already-allocated stock
+                CASE 
+                    WHEN OrderLine.AllocatedQuantity > 0 THEN 1  -- Push allocated to back
+                    ELSE 0                                        -- Unallocated get priority
+                END,
+                -- Priority 2: Earliest promised date first
+                OrderHeader.PromisedDeliveryDate ASC,            -- CRITICAL: Drives urgency
+                -- Priority 3: Older orders break ties
+                OrderHeader.DocumentDate ASC                     -- First in, first out
         ) AS PriorityRank
-        -- RESULT: PriorityRank=1 is highest priority, 
-        --         PriorityRank=2 is second, etc.
+        -- Result: For each SKU, rank=1 is highest priority, rank=2 next, etc.
         
-    FROM 
-        -- =====================================================================
-        -- TABLE JOINS
-        -- =====================================================================
-        CustomerAccount Customer
-        INNER JOIN SalesOrderHeader OrderHeader 
-            ON Customer.CustomerAccountID = OrderHeader.CustomerID
-        INNER JOIN SalesOrderLine OrderLine 
-            ON OrderHeader.OrderHeaderID = OrderLine.OrderHeaderID
-        INNER JOIN SalesOrderLineView OrderLineView 
-            ON OrderHeader.OrderHeaderID = OrderLineView.OrderHeaderID 
-            AND OrderLine.PrintSequenceNumber = OrderLineView.PrintSequenceNumber
-            -- Join on both fields to ensure exact line match
-        INNER JOIN SystemCurrency Currency 
-            ON Customer.CurrencyID = Currency.CurrencyID
-        INNER JOIN UniqueNominalAccounts NL 
-            ON OrderLine.NominalAccountRef = NL.AccountNumber
-            -- Use deduplicated nominal accounts from CTE 1
-        LEFT JOIN StockLevels SL 
-            ON OrderLineView.ItemCode = SL.Code
-            -- LEFT JOIN because not all items may have stock records
-            
+    FROM dbo.SOPOrderLine OrderLine
+    
+    -- Join to get order header details
+    INNER JOIN dbo.SOPOrderReturn OrderHeader 
+        ON OrderLine.SOPOrderReturnID = OrderHeader.SOPOrderReturnID
+    
+    -- Get customer information
+    INNER JOIN dbo.SLCustomerAccount Customer 
+        ON OrderHeader.CustomerID = Customer.SLCustomerAccountID
+    
+    -- Get item/product details
+    INNER JOIN dbo.SOPOrderLineView OrderLineView 
+        ON OrderLine.SOPOrderLineID = OrderLineView.SOPOrderLineID
+    
+    -- Get currency info for multi-currency handling
+    INNER JOIN dbo.Currency Currency 
+        ON OrderHeader.CurrencyID = Currency.CurrencyID
+    
+    -- Link to stock levels (calculated in CTE 2)
+    LEFT JOIN StockLevels SL 
+        ON OrderLineView.ItemCode = SL.Code
+    
+    -- Link to accounting codes (deduplicated in CTE 1)
+    LEFT JOIN UniqueNominalAccounts UNA 
+        ON OrderLine.NominalSpecificationID = UNA.NLNominalAccountID
+    
     WHERE 
-        OrderHeader.DocumentTypeID <= 1                        -- Sales orders and returns only
-        AND OrderHeader.DocumentStatusId <> 2                  -- Exclude completed orders
-        AND OrderLine.LineQuantity > OrderLine.DespatchReceiptQuantity
-        -- Only include lines with outstanding quantities
+        -- FILTER 1: Only live orders (exclude cancelled, on hold, completed)
+        OrderHeader.DocumentStatusId = 0
+        
+        -- FILTER 2: Only actual stock items (exclude text lines, charges, comments)
+        AND OrderLine.LineTypeID = 0
+        
+        -- FILTER 3: Only lines with outstanding quantity
+        AND (OrderLine.LineQuantity - OrderLine.DespatchReceiptQuantity) > 0
+        
+        -- FILTER 4: Only sales orders (exclude returns)
+        AND OrderHeader.DocumentTypeID = 0
 ),
 
 -- ============================================================================
--- CTE 4: RUNNING TOTAL CALCULATION (WATERFALL LOGIC)
+-- CTE 4: STOCK ALLOCATION WATERFALL ALGORITHM
 -- ============================================================================
--- PURPOSE: Calculate cumulative demand as we work down the priority list
--- 
--- WHY WE NEED THIS:
---   If we have 100 units in stock and 5 orders:
---   - Order 1 (priority 1) needs 30 units  → Running total = 30
---   - Order 2 (priority 2) needs 40 units  → Running total = 70
---   - Order 3 (priority 3) needs 50 units  → Running total = 120 (exceeds stock!)
---   - Order 4 (priority 4) needs 20 units  → Running total = 140
---   - Order 5 (priority 5) needs 10 units  → Running total = 150
+-- PURPOSE: Calculate how much stock each order line should receive
 --
--- RESULT: Orders 1-2 get full allocation, Order 3 gets partial (30 units),
---         Orders 4-5 get nothing (stock exhausted)
+-- ALGORITHM: "Waterfall" allocation
+--   1. Highest priority order gets stock first (up to what it needs)
+--   2. Remaining stock goes to next priority order
+--   3. Continue until stock is exhausted or all orders fulfilled
 --
--- TECHNICAL NOTE:
---   Window functions with ROWS clause allow us to calculate running totals
---   efficiently without self-joins or cursors
--- ============================================================================
-StockDistribution AS (
-    SELECT
-        *,  -- Include all columns from previous CTE
-        
-        -- =====================================================================
-        -- RUNNING TOTAL: CUMULATIVE DEMAND
-        -- =====================================================================
-        SUM(EligibleQuantityDue) OVER (
-            PARTITION BY ItemCode                              -- Separate calculation per item
-            ORDER BY PriorityRank                              -- Follow priority order
-            ROWS UNBOUNDED PRECEDING                           -- Include all rows from start to current
-        ) AS RunningQuantityDue,
-        -- EXAMPLE: If priorities 1,2,3 need 10,20,30 units, 
-        --          running totals are 10,30,60
-        
-        -- =====================================================================
-        -- RUNNING TOTAL: DEMAND BEFORE CURRENT ROW
-        -- =====================================================================
-        ISNULL(SUM(EligibleQuantityDue) OVER (
-            PARTITION BY ItemCode 
-            ORDER BY PriorityRank 
-            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING   
-            -- All previous rows, but NOT current row
-        ), 0) AS PreviousRunningQuantityDue
-        -- EXAMPLE: For priority 3, this shows demand from priorities 1-2 only
-        -- USED FOR: "How much stock is already claimed by higher priorities?"
-        -- ISNULL handles first row (which has no previous rows) → returns 0
-        
-    FROM OrderLinesWithPriority
-),
-
--- ============================================================================
--- CTE 5: FINAL STOCK ALLOCATION LOGIC
--- ============================================================================
--- PURPOSE: Determine exactly how much stock each order line should receive
+-- EXAMPLE:
+--   Available Stock: 100 units of Item X
+--   Order A (Priority 1): Needs 60 → Gets 60, leaves 40
+--   Order B (Priority 2): Needs 50 → Gets 40, leaves 0
+--   Order C (Priority 3): Needs 30 → Gets 0 (no stock left)
 --
--- ALLOCATION ALGORITHM:
---   IF line already has allocation 
---      THEN 0 (don't double-allocate)
---   ELSE IF all stock consumed by higher priorities 
---      THEN 0 (nothing left)
---   ELSE IF enough stock for this line and all higher priorities 
---      THEN full allocation
---   ELSE 
---      partial allocation (whatever's left)
---
--- EXAMPLE SCENARIO:
---   Available Stock: 100 units
---   Priority 1: Needs 30 → Gets 30 (100-0=30)
---   Priority 2: Needs 40 → Gets 40 (100-30=40)
---   Priority 3: Needs 50 → Gets 30 (100-70=30, only 30 left!)
---   Priority 4: Needs 20 → Gets 0 (100-100=0, nothing left)
+-- TECHNICAL IMPLEMENTATION:
+--   - Running total tracks stock consumed by higher-priority orders
+--   - ROWS UNBOUNDED PRECEDING = "all orders before this one"
+--   - Each order "sees" how much stock was used already
 -- ============================================================================
 FinalAllocation AS (
-    SELECT
-        *,  -- Include all columns from previous CTE
+    SELECT 
+        *,
+        -- Calculate cumulative stock used by all PREVIOUS orders (same SKU)
+        SUM(QuantityDue) OVER (
+            PARTITION BY ItemCode                         -- Separate totals per SKU
+            ORDER BY PriorityRank                         -- Process in priority order
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING  -- All rows BEFORE current
+        ) AS StockUsedByHigherPriorityOrders,
+        -- Example: If Priority 1 used 50, Priority 2 sees "50" here
         
-        -- =====================================================================
-        -- PROPOSED ALLOCATION CALCULATION
-        -- =====================================================================
+        -- Calculate remaining stock after previous orders
+        TotalStockLevel - ISNULL(
+            SUM(QuantityDue) OVER (
+                PARTITION BY ItemCode
+                ORDER BY PriorityRank
+                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+            ), 0
+        ) AS StockRemainingBeforeThisOrder,
+        -- Example: 100 total - 50 used = 50 remaining for this order
+        
+        -- Calculate actual allocation for THIS order
         CASE
-            -- SCENARIO 1: Already allocated → don't allocate more
-            WHEN AllocatedQuantity > 0 THEN 0  
+            -- Scenario 1: Enough stock to fulfill entire order
+            WHEN TotalStockLevel - ISNULL(
+                SUM(QuantityDue) OVER (
+                    PARTITION BY ItemCode
+                    ORDER BY PriorityRank
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                ), 0
+            ) >= QuantityDue THEN QuantityDue
+            -- Give them everything they need
             
-            -- SCENARIO 2: Stock exhausted by higher priorities
-            WHEN TotalStockLevel <= PreviousRunningQuantityDue THEN 0  
-            -- EXAMPLE: 100 units in stock, but priority 1-5 already claimed 120 
-            --          → nothing left
+            -- Scenario 2: Some stock left, but not enough
+            WHEN TotalStockLevel - ISNULL(
+                SUM(QuantityDue) OVER (
+                    PARTITION BY ItemCode
+                    ORDER BY PriorityRank
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                ), 0
+            ) > 0 THEN TotalStockLevel - ISNULL(
+                SUM(QuantityDue) OVER (
+                    PARTITION BY ItemCode
+                    ORDER BY PriorityRank
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                ), 0
+            )
+            -- Give them whatever's left
             
-            -- SCENARIO 3: Full allocation possible
-            WHEN TotalStockLevel >= RunningQuantityDue THEN EligibleQuantityDue  
-            -- EXAMPLE: 100 units in stock, priorities 1-current only need 80 
-            --          → can fulfill completely
-            
-            -- SCENARIO 4: Partial allocation (stock runs out partway through this line)
-            ELSE GREATEST(TotalStockLevel - PreviousRunningQuantityDue, 0)
-            -- EXAMPLE: 100 in stock, previous priorities claimed 90, current needs 30
-            --          → Can only allocate 10 (100-90)
-            -- GREATEST ensures we never return negative numbers
-        END AS ProposedStockAllocation,
+            -- Scenario 3: No stock remaining
+            ELSE 0
+            -- Sorry, nothing left for you
+        END AS ProposedStockAllocation
         
-        -- =====================================================================
-        -- TOTAL DISTRIBUTED STOCK PER ITEM
-        -- =====================================================================
-        -- Sum of all proposed allocations for this item (used to calculate leftovers)
-        SUM(CASE
-            WHEN AllocatedQuantity > 0 THEN 0
-            WHEN TotalStockLevel <= PreviousRunningQuantityDue THEN 0
-            WHEN TotalStockLevel >= RunningQuantityDue THEN EligibleQuantityDue
-            ELSE GREATEST(TotalStockLevel - PreviousRunningQuantityDue, 0)
-        END) OVER (PARTITION BY ItemCode) AS TotalDistributedStock
-        -- Window function without ORDER BY = calculates total across all rows for each item
-        
-    FROM StockDistribution
+    FROM OrderLinesWithPriority
 )
 
 -- ============================================================================
--- FINAL OUTPUT: BUSINESS-READY STOCK ALLOCATION REPORT
+-- FINAL SELECT: USER-FRIENDLY OUTPUT
 -- ============================================================================
--- PURPOSE: Use technical calculations to action stock issues
--- AUDIENCE: Warehouse managers, sales team, operations planners
--- USAGE: Daily stock allocation meetings, customer promise updates
---
--- KEY OUTPUT FIELDS:
---   - Proposed Allocation: What warehouse should pick
---   - Total Available to Ship: What sales can promise to customer
---   - Proposed Status: Will this fulfill the order?
---   - Value Available to Ship: Revenue impact
+-- PURPOSE: Format results for end users (production planners)
+-- APPROACH: Group related fields into logical sections with clear labels
 -- ============================================================================
 SELECT
     -- =========================================================================
     -- SECTION 1: ORDER IDENTIFICATION
     -- =========================================================================
-    LineID AS 'Order Line ID',
-    LineNumber AS 'Line Number',
-    DocumentNo AS 'Document No',
-    CustomerDocumentNo AS 'Customer Order No',
+    DocumentNo AS 'Sales Order',
+    LineNumber AS 'Line',
+    CustomerDocumentNo AS 'Customer PO',
     CustomerAccountNumber AS 'Customer Code',
     CustomerAccountName AS 'Customer Name',
     
     -- =========================================================================
-    -- SECTION 2: PRODUCT INFORMATION
+    -- SECTION 2: PRODUCT DETAILS
     -- =========================================================================
     ItemCode AS 'Item Code',
     ItemDescription AS 'Description',
     
     -- =========================================================================
-    -- SECTION 3: QUANTITY ANALYSIS
+    -- SECTION 3: QUANTITY SUMMARY
     -- =========================================================================
-    Quantity AS 'Quantity Ordered',
-    DespatchReceiptQuantity AS 'Despatched Quantity',
-    InvoiceCreditQuantity AS 'Invoiced Quantity',
-    QuantityDue AS 'Quantity Outstanding',
-    AllocatedQuantity AS 'Currently Allocated',
+    Quantity AS 'Ordered Qty',
+    DespatchReceiptQuantity AS 'Despatched Qty',
+    QuantityDue AS 'Outstanding Qty',
+    AllocatedQuantity AS 'Already Allocated',
+    TotalStockLevel AS 'Total Stock Available',
     
     -- =========================================================================
-    -- SECTION 4: STOCK ALLOCATION RECOMMENDATIONS - KEY SECTION
+    -- SECTION 4: THE KEY OUTPUT - PROPOSED ALLOCATION
     -- =========================================================================
-    -- This is the actionable output section that drives daily decisions
-    
-    TotalStockLevel AS 'Current Stock Level',
-    
+    -- This is what planners actually care about
     ProposedStockAllocation AS 'Proposed Allocation',
-    -- KEY FIELD: This is what warehouse should pick
     
-    AllocatedQuantity + ProposedStockAllocation AS 'Total Available to Ship',
-    -- KEY FIELD: This is what sales can promise to customer
-    
-    (AllocatedQuantity + ProposedStockAllocation) * (UnitSellingPrice / ExchangeRate) 
-        AS 'Value Available to Ship (GBP)',
-    -- Financial impact: how much revenue can we recover?
-    
-    TotalStockLevel - TotalDistributedStock AS 'Stock Remaining After Allocation',
-    -- Leftover stock after all allocations (for purchasing decisions)
+    -- Show what's left for other orders after this allocation
+    StockRemainingBeforeThisOrder - ProposedStockAllocation AS 'Stock After Allocation',
     
     -- =========================================================================
-    -- SECTION 5: STATUS INDICATORS
+    -- SECTION 5: STATUS COMPARISON
     -- =========================================================================
-    -- Human-readable status labels for quick scanning
+    -- Show before/after to help planners understand impact
     
     -- Current allocation status (before this algorithm runs)
     CASE 
