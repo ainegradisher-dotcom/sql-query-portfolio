@@ -15,10 +15,6 @@ I'm a self-taught Systems Data Analyst based in Worthing, UK. This is my page de
 - Stored procedures and automation
 - ERP/CRM integration
 
-## About Me
-
-I'm currently a Systems Data Analyst at Dellner Polymer Solutions, where I build data systems that integrate siloed information and automate manual processes. 
-
 **Certifications:**
 - IBM SQL: A Practical Introduction for Querying Databases (2024)
 - Microsoft Power BI Certified (2024-2025)
